@@ -10,8 +10,12 @@
 (define-constant err-invalid-price (err u104))
 (define-constant err-insufficient-funds (err u105))
 (define-constant err-transfer-failed (err u106))
+(define-constant err-collection-not-found (err u107))
+(define-constant err-collection-limit-reached (err u108))
+(define-constant err-already-in-collection (err u109))
 
 (define-data-var last-token-id uint u0)
+(define-data-var last-collection-id uint u0)
 (define-data-var marketplace-fee uint u250)
 (define-data-var total-memes uint u0)
 
@@ -47,6 +51,19 @@
     bio: (string-ascii 200),
     joined-at: uint
 })
+
+(define-map collections uint {
+    name: (string-ascii 100),
+    description: (string-ascii 300),
+    creator: principal,
+    created-at: uint,
+    cover-image: (string-ascii 200),
+    is-public: bool
+})
+
+(define-map collection-memes uint (list 50 uint))
+
+(define-map meme-collections uint uint)
 
 (define-public (mint-meme 
     (title (string-ascii 100))
@@ -199,6 +216,70 @@
     )
 )
 
+(define-public (create-collection 
+    (name (string-ascii 100))
+    (description (string-ascii 300))
+    (cover-image (string-ascii 200))
+    (is-public bool))
+    (let (
+        (collection-id (+ (var-get last-collection-id) u1))
+        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (map-set collections collection-id {
+        name: name,
+        description: description,
+        creator: tx-sender,
+        created-at: current-time,
+        cover-image: cover-image,
+        is-public: is-public
+    })
+    (map-set collection-memes collection-id (list))
+    (var-set last-collection-id collection-id)
+    (ok collection-id)
+    )
+)
+
+(define-public (add-meme-to-collection (token-id uint) (collection-id uint))
+    (let (
+        (collection-info (unwrap! (map-get? collections collection-id) err-collection-not-found))
+        (current-memes (default-to (list) (map-get? collection-memes collection-id)))
+        (meme-info (unwrap! (map-get? meme-data token-id) err-not-found))
+        (existing-collection (map-get? meme-collections token-id))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (get creator collection-info)) err-not-authorized)
+        (asserts! (is-none existing-collection) err-already-in-collection)
+        (asserts! (< (len current-memes) u50) err-collection-limit-reached)
+        (map-set collection-memes collection-id (unwrap-panic (as-max-len? (append current-memes token-id) u50)))
+        (map-set meme-collections token-id collection-id)
+        (ok true)
+    ))
+)
+
+(define-public (remove-meme-from-collection (token-id uint))
+    (let (
+        (collection-id (unwrap! (map-get? meme-collections token-id) err-collection-not-found))
+        (collection-info (unwrap! (map-get? collections collection-id) err-collection-not-found))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (get creator collection-info)) err-not-authorized)
+        (map-delete meme-collections token-id)
+        (unwrap-panic (remove-token-from-collection-list collection-id token-id))
+        (ok true)
+    ))
+)
+
+(define-public (update-collection-visibility (collection-id uint) (is-public bool))
+    (let (
+        (collection-info (unwrap! (map-get? collections collection-id) err-collection-not-found))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (get creator collection-info)) err-not-authorized)
+        (map-set collections collection-id (merge collection-info {is-public: is-public}))
+        (ok true)
+    ))
+)
+
 (define-read-only (get-last-token-id)
     (ok (var-get last-token-id))
 )
@@ -243,6 +324,22 @@
     (ok (var-get marketplace-fee))
 )
 
+(define-read-only (get-collection (collection-id uint))
+    (ok (map-get? collections collection-id))
+)
+
+(define-read-only (get-collection-memes (collection-id uint))
+    (ok (map-get? collection-memes collection-id))
+)
+
+(define-read-only (get-meme-collection (token-id uint))
+    (ok (map-get? meme-collections token-id))
+)
+
+(define-read-only (get-last-collection-id)
+    (ok (var-get last-collection-id))
+)
+
 (define-private (update-creator-stats (creator principal) (meme-count uint) (earnings uint))
     (let (
         (current-stats (default-to {total-memes: u0, total-earnings: u0, followers: u0} 
@@ -280,3 +377,19 @@
     )
 )
 
+(define-private (remove-token-from-collection-list (collection-id uint) (target-token uint))
+    (let (
+        (current-memes (default-to (list) (map-get? collection-memes collection-id)))
+        (filtered-memes (fold rebuild-list-without-token current-memes {target: target-token, result: (list)}))
+    )
+    (map-set collection-memes collection-id (get result filtered-memes))
+    (ok true)
+    )
+)
+
+(define-private (rebuild-list-without-token (token uint) (ctx {target: uint, result: (list 50 uint)}))
+    (if (is-eq token (get target ctx))
+        ctx
+        {target: (get target ctx), result: (unwrap-panic (as-max-len? (append (get result ctx) token) u50))}
+    )
+)
