@@ -5,10 +5,6 @@ authors = []
 telemetry = true
 cache_dir = '.\.cache'
 requirements = []
-[contracts.nft-trait]
-path = 'contracts/nft-trait.clar'
-clarity_version = 3
-epoch = 3.1
 
 [contracts.Memes-as-NFts-For-Creators]
 path = 'contracts/Memes-as-NFts-For-Creators.clar'

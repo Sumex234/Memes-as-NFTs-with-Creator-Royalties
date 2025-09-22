@@ -1,5 +1,3 @@
-(impl-trait .nft-trait.nft-trait)
-
 (define-non-fungible-token meme-nft uint)
 
 (define-constant contract-owner tx-sender)
@@ -13,6 +11,7 @@
 (define-constant err-collection-not-found (err u107))
 (define-constant err-collection-limit-reached (err u108))
 (define-constant err-already-in-collection (err u109))
+(define-constant err-token-frozen (err u110))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-collection-id uint u0)
@@ -64,6 +63,7 @@
 (define-map collection-memes uint (list 50 uint))
 
 (define-map meme-collections uint uint)
+(define-map token-freeze-until uint uint)
 
 (define-public (mint-meme 
     (title (string-ascii 100))
@@ -135,9 +135,11 @@
         (royalty-amount (/ (* price royalty-percentage) u10000))
         (seller-amount (- price (+ marketplace-fee-amount royalty-amount)))
         (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (freeze-until (default-to u0 (map-get? token-freeze-until token-id)))
     )
     (begin
         (asserts! (not (is-eq tx-sender seller)) err-not-authorized)
+        (asserts! (or (is-eq freeze-until u0) (>= current-time freeze-until)) err-token-frozen)
         (try! (stx-transfer? price tx-sender seller))
         (try! (stx-transfer? marketplace-fee-amount seller contract-owner))
         (try! (stx-transfer? royalty-amount seller creator))
@@ -194,17 +196,17 @@
 )
 
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
+    (let (
+        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (freeze-until (default-to u0 (map-get? token-freeze-until token-id)))
+    )
     (begin
         (asserts! (is-eq tx-sender sender) err-not-authorized)
+        (asserts! (or (is-eq freeze-until u0) (>= current-time freeze-until)) err-token-frozen)
         (try! (nft-transfer? meme-nft token-id sender recipient))
-        (let (
-            (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
-        )
-        (begin
-            (unwrap-panic (update-ownership-history token-id recipient current-time))
-            (ok true)
-        ))
-    )
+        (unwrap-panic (update-ownership-history token-id recipient current-time))
+        (ok true)
+    ))
 )
 
 (define-public (set-marketplace-fee (new-fee uint))
@@ -338,6 +340,23 @@
 
 (define-read-only (get-last-collection-id)
     (ok (var-get last-collection-id))
+)
+
+(define-public (set-token-freeze-until (token-id uint) (until-time uint))
+    (let (
+        (meme-info (unwrap! (map-get? meme-data token-id) err-not-found))
+    )
+    (begin
+        (asserts! (is-eq tx-sender (get creator meme-info)) err-not-authorized)
+        (if (is-eq until-time u0)
+            (begin (map-delete token-freeze-until token-id) (ok true))
+            (begin (map-set token-freeze-until token-id until-time) (ok true))
+        )
+    ))
+)
+
+(define-read-only (get-token-freeze-until (token-id uint))
+    (ok (map-get? token-freeze-until token-id))
 )
 
 (define-private (update-creator-stats (creator principal) (meme-count uint) (earnings uint))
