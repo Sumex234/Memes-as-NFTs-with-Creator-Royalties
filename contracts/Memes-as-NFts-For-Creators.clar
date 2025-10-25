@@ -12,6 +12,8 @@
 (define-constant err-collection-limit-reached (err u108))
 (define-constant err-already-in-collection (err u109))
 (define-constant err-token-frozen (err u110))
+(define-constant err-invalid-remix (err u111))
+(define-constant err-remix-chain-limit (err u112))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-collection-id uint u0)
@@ -65,6 +67,15 @@
 (define-map meme-collections uint uint)
 (define-map token-freeze-until uint uint)
 
+(define-map meme-remix-data uint {
+    original-meme: (optional uint),
+    remix-depth: uint,
+    original-creator: (optional principal),
+    remix-count: uint
+})
+
+(define-map meme-remixes uint (list 20 uint))
+
 (define-public (mint-meme 
     (title (string-ascii 100))
     (description (string-ascii 500))
@@ -90,6 +101,12 @@
             tags: tags
         })
         (map-set meme-ownership-history token-id (list {owner: recipient, timestamp: current-time}))
+        (map-set meme-remix-data token-id {
+            original-meme: none,
+            remix-depth: u0,
+            original-creator: none,
+            remix-count: u0
+        })
         (unwrap-panic (update-creator-stats tx-sender u1 u0))
         (var-set last-token-id token-id)
         (var-set total-memes (+ (var-get total-memes) u1))
@@ -149,6 +166,58 @@
         (unwrap-panic (update-ownership-history token-id tx-sender current-time))
         (unwrap-panic (increase-viral-score token-id))
         (ok true)
+    ))
+)
+
+(define-public (mint-remix 
+    (original-token-id uint)
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (image-url (string-ascii 200))
+    (royalty-percentage uint)
+    (tags (string-ascii 200))
+    (recipient principal))
+    (let (
+        (token-id (+ (var-get last-token-id) u1))
+        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (original-data (unwrap! (map-get? meme-data original-token-id) err-not-found))
+        (original-remix-data (unwrap! (map-get? meme-remix-data original-token-id) err-not-found))
+        (original-depth (get remix-depth original-remix-data))
+        (new-depth (+ original-depth u1))
+        (root-creator (if (is-some (get original-creator original-remix-data))
+            (get original-creator original-remix-data)
+            (some (get creator original-data))))
+        (current-remixes (default-to (list) (map-get? meme-remixes original-token-id)))
+    )
+    (begin
+        (asserts! (<= royalty-percentage u1000) err-invalid-price)
+        (asserts! (<= new-depth u5) err-remix-chain-limit)
+        (try! (nft-mint? meme-nft token-id recipient))
+        (map-set meme-data token-id {
+            title: title,
+            description: description,
+            image-url: image-url,
+            creator: tx-sender,
+            creation-time: current-time,
+            royalty-percentage: royalty-percentage,
+            viral-score: u0,
+            tags: tags
+        })
+        (map-set meme-ownership-history token-id (list {owner: recipient, timestamp: current-time}))
+        (map-set meme-remix-data token-id {
+            original-meme: (some original-token-id),
+            remix-depth: new-depth,
+            original-creator: root-creator,
+            remix-count: u0
+        })
+        (map-set meme-remix-data original-token-id 
+            (merge original-remix-data {remix-count: (+ (get remix-count original-remix-data) u1)}))
+        (map-set meme-remixes original-token-id 
+            (unwrap-panic (as-max-len? (append current-remixes token-id) u20)))
+        (unwrap-panic (update-creator-stats tx-sender u1 u0))
+        (var-set last-token-id token-id)
+        (var-set total-memes (+ (var-get total-memes) u1))
+        (ok token-id)
     ))
 )
 
@@ -357,6 +426,24 @@
 
 (define-read-only (get-token-freeze-until (token-id uint))
     (ok (map-get? token-freeze-until token-id))
+)
+
+(define-read-only (get-meme-remix-data (token-id uint))
+    (ok (map-get? meme-remix-data token-id))
+)
+
+(define-read-only (get-meme-remixes (token-id uint))
+    (ok (map-get? meme-remixes token-id))
+)
+
+(define-read-only (is-remix (token-id uint))
+    (let (
+        (remix-data (map-get? meme-remix-data token-id))
+    )
+    (ok (if (is-some remix-data)
+            (is-some (get original-meme (unwrap-panic remix-data)))
+            false))
+    )
 )
 
 (define-private (update-creator-stats (creator principal) (meme-count uint) (earnings uint))
