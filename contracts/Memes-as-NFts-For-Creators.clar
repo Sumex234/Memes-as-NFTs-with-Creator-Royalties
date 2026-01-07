@@ -14,6 +14,12 @@
 (define-constant err-token-frozen (err u110))
 (define-constant err-invalid-remix (err u111))
 (define-constant err-remix-chain-limit (err u112))
+(define-constant err-auction-active (err u113))
+(define-constant err-auction-not-found (err u114))
+(define-constant err-auction-ended (err u115))
+(define-constant err-bid-too-low (err u116))
+(define-constant err-auction-not-ended (err u117))
+(define-constant err-no-bids (err u118))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-collection-id uint u0)
@@ -75,6 +81,15 @@
 })
 
 (define-map meme-remixes uint (list 20 uint))
+
+(define-map meme-auctions uint {
+    seller: principal,
+    reserve-price: uint,
+    min-increment: uint,
+    end-time: uint,
+    highest-bidder: (optional principal),
+    highest-bid: uint
+})
 
 (define-public (mint-meme 
     (title (string-ascii 100))
@@ -411,6 +426,103 @@
     (ok (var-get last-collection-id))
 )
 
+(define-public (create-auction (token-id uint) (reserve-price uint) (min-increment uint) (duration uint))
+    (let (
+        (owner (unwrap! (nft-get-owner? meme-nft token-id) err-not-found))
+        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (end-time (+ current-time duration))
+        (existing-auction (map-get? meme-auctions token-id))
+    )
+    (begin
+        (asserts! (is-eq tx-sender owner) err-not-authorized)
+        (asserts! (is-none existing-auction) err-auction-active)
+        (asserts! (> reserve-price u0) err-invalid-price)
+        (asserts! (> min-increment u0) err-invalid-price)
+        (asserts! (> duration u0) err-invalid-price)
+        (try! (nft-transfer? meme-nft token-id tx-sender (as-contract tx-sender)))
+        (map-set meme-auctions token-id {
+            seller: tx-sender,
+            reserve-price: reserve-price,
+            min-increment: min-increment,
+            end-time: end-time,
+            highest-bidder: none,
+            highest-bid: u0
+        })
+        (ok true)
+    ))
+)
+
+(define-public (place-bid (token-id uint) (bid-amount uint))
+    (let (
+        (auction (unwrap! (map-get? meme-auctions token-id) err-auction-not-found))
+        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (current-highest (get highest-bid auction))
+        (current-bidder (get highest-bidder auction))
+        (min-required (if (is-eq current-highest u0) 
+                         (get reserve-price auction)
+                         (+ current-highest (get min-increment auction))))
+    )
+    (begin
+        (asserts! (< current-time (get end-time auction)) err-auction-ended)
+        (asserts! (>= bid-amount min-required) err-bid-too-low)
+        (asserts! (not (is-eq tx-sender (get seller auction))) err-not-authorized)
+        (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+        (if (is-some current-bidder)
+            (try! (as-contract (stx-transfer? current-highest tx-sender (unwrap-panic current-bidder))))
+            true
+        )
+        (map-set meme-auctions token-id (merge auction {
+            highest-bidder: (some tx-sender),
+            highest-bid: bid-amount
+        }))
+        (ok true)
+    ))
+)
+
+(define-public (settle-auction (token-id uint))
+    (let (
+        (auction (unwrap! (map-get? meme-auctions token-id) err-auction-not-found))
+        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (seller (get seller auction))
+        (winner (unwrap! (get highest-bidder auction) err-no-bids))
+        (final-price (get highest-bid auction))
+        (meme-info (unwrap! (map-get? meme-data token-id) err-not-found))
+        (creator (get creator meme-info))
+        (royalty-percentage (get royalty-percentage meme-info))
+        (marketplace-fee-amount (/ (* final-price (var-get marketplace-fee)) u10000))
+        (royalty-amount (/ (* final-price royalty-percentage) u10000))
+        (seller-amount (- final-price (+ marketplace-fee-amount royalty-amount)))
+    )
+    (begin
+        (asserts! (>= current-time (get end-time auction)) err-auction-not-ended)
+        (try! (as-contract (stx-transfer? seller-amount tx-sender seller)))
+        (try! (as-contract (stx-transfer? marketplace-fee-amount tx-sender contract-owner)))
+        (try! (as-contract (stx-transfer? royalty-amount tx-sender creator)))
+        (try! (as-contract (nft-transfer? meme-nft token-id tx-sender winner)))
+        (map-delete meme-auctions token-id)
+        (unwrap-panic (update-creator-stats creator u0 royalty-amount))
+        (unwrap-panic (update-ownership-history token-id winner current-time))
+        (unwrap-panic (increase-viral-score token-id))
+        (ok true)
+    ))
+)
+
+(define-public (cancel-auction (token-id uint))
+    (let (
+        (auction (unwrap! (map-get? meme-auctions token-id) err-auction-not-found))
+        (seller (get seller auction))
+        (current-bidder (get highest-bidder auction))
+        (current-bid (get highest-bid auction))
+    )
+    (begin
+        (asserts! (is-eq tx-sender seller) err-not-authorized)
+        (asserts! (is-none current-bidder) err-auction-active)
+        (try! (as-contract (nft-transfer? meme-nft token-id tx-sender seller)))
+        (map-delete meme-auctions token-id)
+        (ok true)
+    ))
+)
+
 (define-public (set-token-freeze-until (token-id uint) (until-time uint))
     (let (
         (meme-info (unwrap! (map-get? meme-data token-id) err-not-found))
@@ -434,6 +546,10 @@
 
 (define-read-only (get-meme-remixes (token-id uint))
     (ok (map-get? meme-remixes token-id))
+)
+
+(define-read-only (get-auction (token-id uint))
+    (ok (map-get? meme-auctions token-id))
 )
 
 (define-read-only (is-remix (token-id uint))
